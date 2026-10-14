@@ -104,9 +104,48 @@ IP_ALIASES: dict[str, list[str]] = {
 # relative to Bill Status/Confirmed Date.
 IP_SHIFT_FIELD_COUNT = 8  # Bill Status, Confirmed Date, Admission Date, No. of days Admitted, Department, Doctor, Billing Type, Company Name
 
+# Human-readable labels for the field keys above, for a UI to show someone
+# mapping a field to one of the file's actual columns.
+FIELD_LABELS: dict[str, str] = {
+    "SlNo": "Sl. No.",
+    "BillNo": "Bill No.",
+    "Date": "Date (Bill Date / Discharge Date)",
+    "MRD": "MRD No.",
+    "VisitCode": "Visit Code",
+    "BillType": "Bill Type",
+    "PatientName": "Patient Name",
+    "Category": "Category",
+    "TotalAmt": "Total Amt (Inc. Tax)",
+    "NetAmt": "Net Amt",
+    "PaidAmt": "Paid Amt",
+    "PaymentDue": "Payment Due",
+    "CompanyName": "Company Name",
+    "BillStatus": "Bill Status",
+    "ConfirmedDate": "Confirmed Date",
+}
+
 
 class SourceFormatError(ValueError):
-    """Raised when a required column can't be found in a source file."""
+    """Raised when a source file doesn't match what this tool expects."""
+
+
+class MissingColumnsError(SourceFormatError):
+    """Raised when one or more required columns can't be located in a source
+    file by header name, even after any manual column-name mapping supplied.
+    Carries structured data, not just a message, so a UI can offer to map
+    each missing field to one of the file's actual headers."""
+
+    def __init__(self, report_label: str, missing_fields: list[str], available_headers: list[str]):
+        self.report_label = report_label
+        self.missing_fields = missing_fields
+        self.available_headers = available_headers
+        wanted = ", ".join(FIELD_LABELS.get(f, f) for f in missing_fields)
+        super().__init__(
+            f"{report_label}: couldn't find a column for: {wanted}.\n"
+            f"The file's actual headers are: {available_headers}\n"
+            "The report's layout may have changed -- map each missing field to "
+            "the right column before re-running, rather than trusting the output."
+        )
 
 
 @dataclass
@@ -127,27 +166,34 @@ def _normalize_header(header) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(header).upper())
 
 
-def _find_col(df: pd.DataFrame, aliases: list[str], field_name: str, report_label: str) -> int:
-    """Return the 0-based position of the column matching one of `aliases`
-    (tried in order), comparing against each header with whitespace/
-    punctuation stripped and upper-cased. Raises SourceFormatError, naming the
-    field and the headers actually present, if none match."""
+def _locate_fields(df: pd.DataFrame, aliases: dict[str, list[str]], report_label: str,
+                    manual_map: dict[str, str] | None = None) -> dict[str, int]:
+    """Locate every field in `aliases` as a 0-based column position in `df`.
+    `manual_map` (field -> the file's actual header text, as a human chose it
+    in the app's column-mapping dialog) is tried first for each field, ahead
+    of the automatic alias list. Every missing field is collected and raised
+    together as one MissingColumnsError, instead of stopping at the first."""
     normalized = [_normalize_header(c) for c in df.columns]
-    for alias in aliases:
-        for i, n in enumerate(normalized):
-            if n == alias:
-                return i
-    raise SourceFormatError(
-        f"Could not find a '{field_name}' column in {report_label}. "
-        f"Looked for a header matching one of {aliases}; the file's actual "
-        f"headers are: {list(df.columns)}. The report's layout may have "
-        "changed -- check the file before re-running, rather than trusting "
-        "the output."
-    )
-
-
-def _locate_fields(df: pd.DataFrame, aliases: dict[str, list[str]], report_label: str) -> dict[str, int]:
-    return {field: _find_col(df, opts, field, report_label) for field, opts in aliases.items()}
+    cols: dict[str, int] = {}
+    missing: list[str] = []
+    for field, opts in aliases.items():
+        idx = None
+        manual_header = (manual_map or {}).get(field)
+        if manual_header is not None:
+            manual_norm = _normalize_header(manual_header)
+            idx = next((i for i, n in enumerate(normalized) if n == manual_norm), None)
+        if idx is None:
+            for alias in opts:
+                idx = next((i for i, n in enumerate(normalized) if n == alias), None)
+                if idx is not None:
+                    break
+        if idx is None:
+            missing.append(field)
+        else:
+            cols[field] = idx
+    if missing:
+        raise MissingColumnsError(report_label, missing, list(df.columns))
+    return cols
 
 
 def _read_source_table(path: str | Path) -> pd.DataFrame:
@@ -167,9 +213,9 @@ def _as_money(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 
-def load_op_bills(path: str | Path) -> pd.DataFrame:
+def load_op_bills(path: str | Path, column_overrides: dict[str, str] | None = None) -> pd.DataFrame:
     df = _read_source_table(path)
-    cols = _locate_fields(df, OP_ALIASES, "Total Bill Wise Report")
+    cols = _locate_fields(df, OP_ALIASES, "Total Bill Wise Report", column_overrides)
     df = df[df.iloc[:, cols["BillNo"]].notna()].copy()  # drop any row with no Bill No.
 
     out = pd.DataFrame({
@@ -191,9 +237,9 @@ def load_op_bills(path: str | Path) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def load_ip_bills(path: str | Path) -> pd.DataFrame:
+def load_ip_bills(path: str | Path, column_overrides: dict[str, str] | None = None) -> pd.DataFrame:
     df = _read_source_table(path)
-    cols = _locate_fields(df, IP_ALIASES, "Discharge Wise IP Revenue Report")
+    cols = _locate_fields(df, IP_ALIASES, "Discharge Wise IP Revenue Report", column_overrides)
     df = df[df.iloc[:, cols["BillNo"]].notna()].copy()  # drop heading-counter rows and grand-total footer rows
     df = df.reset_index(drop=True)
 
@@ -241,10 +287,37 @@ def load_ip_bills(path: str | Path) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def route_sheet(category, company_name) -> str:
+def _normalize_category(category) -> str:
+    return str(category).strip().upper()
+
+
+def _normalize_company(company_name) -> str:
+    return "" if pd.isna(company_name) else str(company_name).strip().upper()
+
+
+def override_key(category, company_name) -> str:
+    """Two bills can share the exact same Category text but belong on
+    different sheets depending on who's actually paying (e.g. Category
+    'STUDY' with Company Name 'ESI- Beneficiary ...' vs. 'Aasandha Company
+    Limited') -- so a human reviewer's decision, and the override key it's
+    stored under, is per (Category, Company Name) pair, not per Category
+    alone."""
+    return f"{_normalize_category(category)}|{_normalize_company(company_name)}"
+
+
+def route_sheet(category, company_name, overrides: dict[str, str] | None = None) -> str:
+    """Decide which sheet a bill belongs on. `overrides` maps an
+    override_key(category, company_name) to a bucket ("OP GNL" / "PUBLIC" /
+    "TPA"), as decided by a human reviewing the NEEDS REVIEW list in the app
+    -- it takes priority over every rule below, including the blank-company
+    GNL default."""
+    if overrides:
+        key = override_key(category, company_name)
+        if key in overrides:
+            return overrides[key]
+    cat = _normalize_category(category)
     if pd.isna(company_name):
         return "OP GNL"
-    cat = str(category).strip().upper()
     if any(cat.startswith(p) for p in GNL_PREFIXES):
         return "OP GNL"
     if any(k in cat for k in PUBLIC_KEYWORDS):
@@ -252,24 +325,30 @@ def route_sheet(category, company_name) -> str:
     return "TPA"
 
 
-def _is_known_tpa_category(category) -> bool:
-    cat = str(category).strip().upper()
+def _is_known_tpa_category(category, company_name=None, overrides: dict[str, str] | None = None) -> bool:
+    if overrides and override_key(category, company_name) in overrides:
+        return True  # a human already made an explicit call on this category/company pair
+    cat = _normalize_category(category)
     return any(cat.startswith(p) for p in KNOWN_TPA_PREFIXES)
 
 
-def build_combined(op_df: pd.DataFrame, ip_df: pd.DataFrame, report_date: pd.Timestamp) -> pd.DataFrame:
+def build_combined(op_df: pd.DataFrame, ip_df: pd.DataFrame, report_date: pd.Timestamp,
+                    category_overrides: dict[str, str] | None = None) -> pd.DataFrame:
     combined = pd.concat([op_df, ip_df], ignore_index=True)
     end = report_date + pd.Timedelta(hours=23, minutes=59, seconds=59)
     combined = combined[(combined["Date"] >= START_DATE) & (combined["Date"] <= end)].copy()
     combined["Sheet"] = [
-        route_sheet(c, n) for c, n in zip(combined["Category"], combined["CompanyName"])
+        route_sheet(c, n, category_overrides) for c, n in zip(combined["Category"], combined["CompanyName"])
     ]
     return combined.reset_index(drop=True)
 
 
-def needs_review_rows(combined: pd.DataFrame) -> pd.DataFrame:
+def needs_review_rows(combined: pd.DataFrame, category_overrides: dict[str, str] | None = None) -> pd.DataFrame:
     tpa = combined[combined["Sheet"] == "TPA"]
-    unknown = tpa[~tpa["Category"].map(_is_known_tpa_category)]
+    known = tpa.apply(
+        lambda r: _is_known_tpa_category(r["Category"], r["CompanyName"], category_overrides), axis=1
+    )
+    unknown = tpa[~known]
     return unknown[["BillNo", "Date", "Category", "CompanyName", "PaymentDue", "Source"]].copy()
 
 
@@ -521,14 +600,33 @@ def infer_report_date(op_df: pd.DataFrame, ip_df: pd.DataFrame) -> pd.Timestamp:
 
 def build_report(op_path: str | Path, ip_path: str | Path,
                   previous_path: str | Path | None = None,
-                  output_dir: str | Path | None = None) -> BuildResult:
+                  output_dir: str | Path | None = None,
+                  category_overrides: dict[str, str] | None = None,
+                  op_column_overrides: dict[str, str] | None = None,
+                  ip_column_overrides: dict[str, str] | None = None) -> BuildResult:
     """Build the AR Outstanding Report from the two source files, plus an
     optional prior AR report. The prior report, when given, supplies Table
     2's Decrease column (its own Table 1 old-bucket figures for Public/TPA).
     Without it, the OUTSTANDING STATUS sheet holds just Table 1 -- the
     current outstanding totals -- and Table 2 is skipped. The report date is
     inferred from the data, and the output folder defaults to the OP file's
-    folder."""
+    folder.
+
+    `category_overrides` maps an override_key(category, company_name) to the
+    bucket a human reviewer has decided that pair belongs on ("OP GNL" /
+    "PUBLIC" / "TPA") -- it overrides the default routing rules for that
+    exact category+company pair and stops it being flagged on the NEEDS
+    REVIEW sheet again. Keying on the pair, not the category alone, matters
+    because two bills can share the same Category text (e.g. "STUDY") while
+    actually belonging to different payers that need different decisions.
+
+    `op_column_overrides` / `ip_column_overrides` map a field name (e.g.
+    "PaymentDue", see FIELD_LABELS) to the exact header text a human has
+    confirmed that field actually lives under in that file -- used when a
+    report template renames a column to something _locate_fields' built-in
+    alias list doesn't recognise, raising MissingColumnsError. Like
+    `category_overrides`, the app persists these across runs; this function
+    itself has no opinion on where they're stored."""
     warnings: list[str] = []
 
     op_path = Path(op_path)
@@ -536,17 +634,17 @@ def build_report(op_path: str | Path, ip_path: str | Path,
     output_dir = Path(output_dir) if output_dir else op_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    op_df = load_op_bills(op_path)
+    op_df = load_op_bills(op_path, op_column_overrides)
     _check_op_bill_types(op_df)
-    ip_df = load_ip_bills(ip_path)
+    ip_df = load_ip_bills(ip_path, ip_column_overrides)
     n_shifted = ip_df.attrs.get("shifted_rows_fixed", 0)
     if n_shifted:
         warnings.append(f"Fixed {n_shifted} shifted row(s) in the IP file (Bill Status column misaligned).")
 
     report_date = infer_report_date(op_df, ip_df)
 
-    combined = build_combined(op_df, ip_df, report_date)
-    review_df = needs_review_rows(combined)
+    combined = build_combined(op_df, ip_df, report_date, category_overrides)
+    review_df = needs_review_rows(combined, category_overrides)
     if not review_df.empty:
         warnings.append(f"{len(review_df)} bill(s) had an unrecognised TPA & CPR category -- see NEEDS REVIEW sheet.")
 

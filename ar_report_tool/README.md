@@ -6,32 +6,43 @@ real file to the rupee.
 
 ## Monthly use (no Python needed)
 
-Run `dist\AR_Report_Builder.exe`. Three inputs are required:
+Run `dist\AR_Report_Builder.exe`. Step 1 ("Add reports") collects:
 
-1. **Total Bill Wise Report (OP)** -- browse to this month's download.
-2. **Discharge Wise IP Revenue Report** -- browse to this month's download.
-3. **Previous AR Report** -- the AR report output from the last time this
-   report was generated (any file with an `OUTSTANDING STATUS` sheet, not
-   just ones this tool generated).
+1. **Total Bill Wise Report (OP)** -- required, this month's download.
+2. **Discharge Wise IP Revenue Report** -- required, this month's download.
+3. **Previous AR Report** -- optional. When given (any file with an
+   `OUTSTANDING STATUS` sheet, not just ones this tool generated), it supplies
+   Table 2 (Decrease). Without it, the output has just Table 1 -- the current
+   outstanding totals.
 
-Then click **Generate AR Report**. Everything else is automatic:
+Either source file can be `.xlsx`, `.xls`, or `.csv`. Then click **Generate AR
+Report**. Everything else is automatic:
 
 - **Report date** is taken from the data itself (the latest Bill Date /
   Discharge Date in the two files) -- this is exactly the date the downloads
   were made through, so there's nothing to type.
-- **Output location** is always a `Reports` folder next to the .exe (created
-  automatically the first time), saved as `AR as on DD-MM-YYYY.xlsx` --
-  regardless of where the OP/IP/previous files live, so every generated
-  report ends up in one place.
+- **Output location** defaults to a `Reports` folder next to the .exe
+  (changeable in Step 1), saved as `AR as on DD-MM-YYYY.xlsx`.
 - **Table 2 (Decrease)**'s previous-report column is read straight from the
   previous AR report's own Table 1 -- specifically its second column (the
   pre-current-month "old" bucket) for Public/TPA, the same date range as this
   run's own old bucket. The report date shown for it is parsed from that
   file's "Outstanding status as on `<date>`" title.
 
-Check the **NEEDS REVIEW** sheet in the output (only appears if something was
-flagged) -- it lists any bill whose category text wasn't recognised, so a new
-insurer/category name doesn't silently get miscategorised.
+Two kinds of "new data" open a window in Step 3 ("Review results") instead of
+just failing or being buried in an Excel sheet:
+
+- **NEEDS REVIEW** -- a bill landed in TPA & CPR under a category this tool
+  doesn't recognise. Grouped by Category + Company Name (two bills can share
+  the same category but belong to different payers); pick where each group
+  actually belongs and Apply & Regenerate, or Skip to keep the report as
+  generated (those bills stay flagged on the NEEDS REVIEW sheet in the
+  output). Decisions are remembered in `category_overrides.json`, next to the
+  exe, so the same category/company pair is never flagged again.
+- **New column layout** -- a report's columns don't match this tool's
+  built-in header list (a template change). Map each missing field to the
+  file's actual column and Apply & Retry. Mappings are remembered in
+  `column_overrides.json`, next to the exe.
 
 ## What it does differently from a literal reading of the PDF
 
@@ -47,14 +58,17 @@ intentional, not an oversight.)
 ```
 cd ar_report_tool
 python -m pip install -r requirements.txt
-python -m PyInstaller --onefile --noconsole --name "AR_Report_Builder" app.py
+python -m PyInstaller --onefile --noconsole --name "AR_Report_Builder" --collect-data=customtkinter app.py
 ```
+
+(`--collect-data=customtkinter` is required -- without it the exe is missing
+the GUI's theme file and fails to start.)
 
 The exe lands in `dist\AR_Report_Builder.exe`. Test with `cli.py` first --
 it's much faster to iterate on than rebuilding the exe each time:
 
 ```
-python cli.py "<OP file>" "<IP file>" "<previous AR report>" ["<output folder>"]
+python cli.py "<OP file>" "<IP file>" ["<previous AR report>" | -] ["<output folder>"]
 ```
 
 ## Files
