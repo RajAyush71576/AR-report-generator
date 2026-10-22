@@ -36,16 +36,28 @@ START_DATE = pd.Timestamp(2021, 4, 1)
 # Category routing (validated against real data + user decision on 2026-10-12:
 # a Category of ONGC with a real Company Name stays in TPA & CPR, same as any
 # other payer -- only a genuinely blank Company Name, or one of the categories
-# below, sends a bill to OP GNL). User decision on 2026-10-22: a Category of
-# exactly GNL (OP or IP) also stays in TPA & CPR when it carries a real
-# Company Name -- only the other GNL_PREFIXES entries send a bill to OP GNL
-# unconditionally.
-GNL_PREFIXES = ["GNL", "STUDY-FACULTY", "DEP", "FDM", "P.CARD.FUND", "PM FUND"]
+# below, sends a bill to OP GNL). User decision on 2026-10-22: a Category
+# starting with GNL (plain "GNL" or a compound category like GNL-AASANDHA,
+# GNL-OMAN, GNL-SAARC, GNL-SD), or with STUDY / STUDY-FACULTY, also stays in
+# TPA & CPR when it carries a real Company Name -- only the other
+# GNL_PREFIXES entries send a bill to OP GNL unconditionally. GNL/STUDY/
+# STUDY-FACULTY with a blank Company Name still goes to OP GNL, same as any
+# other blank-company bill.
+GNL_PREFIXES = ["GNL", "STUDY", "DEP", "FDM", "P.CARD.FUND", "PM FUND"]
+# Matched against both Category and Company Name (user decision 2026-10-22):
+# ESI/ECHS/CHS appearing in the Company Name routes a bill to Public even
+# when its Category is GNL/STUDY/STUDY-FACULTY -- checked ahead of the TPA
+# default, for any category.
 PUBLIC_KEYWORDS = ["ESI", "ECHS", "CHS"]
 
 # Known TPA & CPR category prefixes -- used only to flag unrecognised category
 # text for manual review; it never changes where a bill is actually routed.
-KNOWN_TPA_PREFIXES = ["TPA", "CPR", "LABCPR", "CSLCPR", "ONGC", "INHS", "SSV-TPA", "EMP-TPA"]
+# GNL/STUDY are included here even though they're not payer names: any GNL or
+# STUDY row that reaches the TPA bucket already carries a real Company Name
+# (route_sheet sends blank-company GNL/STUDY bills to OP GNL instead), so by
+# the time one lands here it's already a settled TPA & CPR case, not an
+# unrecognised category needing a human's eyes.
+KNOWN_TPA_PREFIXES = ["TPA", "CPR", "LABCPR", "CSLCPR", "ONGC", "INHS", "SSV-TPA", "EMP-TPA", "GNL", "STUDY"]
 
 OUT_COLUMNS = [
     "SlNo", "BillNo", "Date", "MRD", "VisitCode", "BillType", "PatientName",
@@ -324,10 +336,14 @@ def route_sheet(category, company_name, overrides: dict[str, str] | None = None)
     if pd.isna(company_name):
         return "OP GNL"
     company = _normalize_company(company_name)
-    gnl_with_company = cat == "GNL" and company != ""  # exact GNL w/ a real payer stays off OP GNL
+    # GNL (incl. compound categories like GNL-AASANDHA, GNL-OMAN, GNL-SAARC,
+    # GNL-SD), or STUDY/STUDY-FACULTY, with a real payer stays off OP GNL.
+    gnl_with_company = (cat.startswith("GNL") or cat.startswith("STUDY")) and company != ""
     if any(cat.startswith(p) for p in GNL_PREFIXES) and not gnl_with_company:
         return "OP GNL"
-    if any(k in cat for k in PUBLIC_KEYWORDS):
+    # ECHS/ESI/CHS in the Company Name itself also routes to Public, even when
+    # the Category is GNL/STUDY/STUDY-FACULTY (user decision 2026-10-22).
+    if any(k in cat for k in PUBLIC_KEYWORDS) or any(k in company for k in PUBLIC_KEYWORDS):
         return "PUBLIC"
     return "TPA"
 
