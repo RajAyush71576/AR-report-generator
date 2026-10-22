@@ -36,7 +36,10 @@ START_DATE = pd.Timestamp(2021, 4, 1)
 # Category routing (validated against real data + user decision on 2026-10-12:
 # a Category of ONGC with a real Company Name stays in TPA & CPR, same as any
 # other payer -- only a genuinely blank Company Name, or one of the categories
-# below, sends a bill to OP GNL).
+# below, sends a bill to OP GNL). User decision on 2026-10-22: a Category of
+# exactly GNL (OP or IP) also stays in TPA & CPR when it carries a real
+# Company Name -- only the other GNL_PREFIXES entries send a bill to OP GNL
+# unconditionally.
 GNL_PREFIXES = ["GNL", "STUDY-FACULTY", "DEP", "FDM", "P.CARD.FUND", "PM FUND"]
 PUBLIC_KEYWORDS = ["ESI", "ECHS", "CHS"]
 
@@ -77,6 +80,7 @@ OP_ALIASES: dict[str, list[str]] = {
     "PaidAmt": ["PAIDAMT"],
     "PaymentDue": ["PAYMENTDUE"],
     "CompanyName": ["COMPANYNAME"],
+    "BillStatus": ["BILLSTATUS"],
 }
 
 IP_ALIASES: dict[str, list[str]] = {
@@ -217,6 +221,7 @@ def load_op_bills(path: str | Path, column_overrides: dict[str, str] | None = No
     df = _read_source_table(path)
     cols = _locate_fields(df, OP_ALIASES, "Total Bill Wise Report", column_overrides)
     df = df[df.iloc[:, cols["BillNo"]].notna()].copy()  # drop any row with no Bill No.
+    df = df[df.iloc[:, cols["BillStatus"]] == "CONF"].copy()  # drop open bills, keep confirmed only
 
     out = pd.DataFrame({
         "SlNo": df.iloc[:, cols["SlNo"]],
@@ -318,7 +323,9 @@ def route_sheet(category, company_name, overrides: dict[str, str] | None = None)
     cat = _normalize_category(category)
     if pd.isna(company_name):
         return "OP GNL"
-    if any(cat.startswith(p) for p in GNL_PREFIXES):
+    company = _normalize_company(company_name)
+    gnl_with_company = cat == "GNL" and company != ""  # exact GNL w/ a real payer stays off OP GNL
+    if any(cat.startswith(p) for p in GNL_PREFIXES) and not gnl_with_company:
         return "OP GNL"
     if any(k in cat for k in PUBLIC_KEYWORDS):
         return "PUBLIC"
